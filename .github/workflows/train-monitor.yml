@@ -1,0 +1,66 @@
+name: Train Ticket Availability Monitor
+
+on:
+  schedule:
+    - cron: '30 3 * * *'   # 9:00 AM IST  (UTC+5:30 → 03:30 UTC)
+    - cron: '30 11 * * *'  # 5:00 PM IST  (UTC+5:30 → 11:30 UTC)
+  workflow_dispatch:        # allows manual trigger from the GitHub Actions UI
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    env:
+      TZ: Asia/Kolkata  # ensures log timestamps and email labels show IST
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # Restore alert state from the previous run so we don't re-send
+      # threshold alerts that already fired earlier today.
+      - name: Restore alert state
+        uses: actions/cache/restore@v4
+        with:
+          path: state.json
+          key: alert-state-${{ github.run_id }}
+          restore-keys: |
+            alert-state-
+
+      - name: Install Tesseract OCR
+        run: sudo apt-get install -y tesseract-ocr
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run availability check
+        env:
+          # ── Secrets (set in repo Settings → Secrets and variables → Actions) ──
+          GMAIL_ADDRESS: ${{ secrets.GMAIL_ADDRESS }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+
+          # ── Variables (set in repo Settings → Secrets and variables → Variables) ──
+          NOTIFY_EMAIL: ${{ vars.NOTIFY_EMAIL }}
+          ALERT_THRESHOLDS: ${{ vars.ALERT_THRESHOLDS }}
+          LOOKAHEAD_DAYS: ${{ vars.LOOKAHEAD_DAYS }}
+          CHENNAI_BLR_WINDOW_START: ${{ vars.CHENNAI_BLR_WINDOW_START }}
+          CHENNAI_BLR_WINDOW_END: ${{ vars.CHENNAI_BLR_WINDOW_END }}
+          BLR_CHENNAI_WINDOW_START: ${{ vars.BLR_CHENNAI_WINDOW_START }}
+          BLR_CHENNAI_WINDOW_END: ${{ vars.BLR_CHENNAI_WINDOW_END }}
+        run: python -c "from alert_engine import run_check; run_check()"
+
+      # Always save state even if the check step fails, so partial results
+      # are preserved and duplicate alerts aren't sent on the next run.
+      - name: Save alert state
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: state.json
+          key: alert-state-${{ github.run_id }}
