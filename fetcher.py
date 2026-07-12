@@ -1,89 +1,139 @@
-"""RapidAPI IRCTC wrapper with an in-memory daily cache for the train list."""
+"""
+Scraper for the official Indian Railways enquiry system.
 
+Site:  https://www.indianrail.gov.in/enquiry
+Flow:  GET page to acquire session cookies
+       GET captchaDraw.png → Tesseract OCR
+       POST /CommonCaptcha with form payload + solved CAPTCHA
+       Retry automatically when CAPTCHA is rejected (up to 4 attempts)
+"""
+
+import io
 import logging
+import time
 from datetime import date, datetime
 from functools import lru_cache
 from typing import Optional
 
 import requests
+from PIL import Image, ImageFilter, ImageOps
+import pytesseract
 
-from config import CLASSES_TO_CHECK, RAPIDAPI_KEY
+from config import CLASSES_TO_CHECK
 
 logger = logging.getLogger(__name__)
 
-_RAPIDAPI_HOST = "irctc1.p.rapidapi.com"
-_RAPIDAPI_BASE = "https://irctc1.p.rapidapi.com/api/v1"
+_BASE = "https://www.indianrail.gov.in/enquiry"
+_CAPTCHA_URL = f"{_BASE}/captchaDraw.png"
+_API_URL = f"{_BASE}/CommonCaptcha"
+
+_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Origin": "https://www.indianrail.gov.in",
+    "Referer": f"{_BASE}/SEAT/SeatAvailability.html",
+    "Content-Type": "application/json;charset=UTF-8",
+}
 
 
-def _headers() -> dict:
-    return {
-        "x-rapidapi-key": RAPIDAPI_KEY,
-        "x-rapidapi-host": _RAPIDAPI_HOST,
-    }
+# ── Session ───────────────────────────────────────────────────────────────────
 
-
-def _get(endpoint: str, params: dict) -> dict:
-    url = f"{_RAPIDAPI_BASE}/{endpoint}"
+def _new_session() -> requests.Session:
+    s = requests.Session()
+    s.headers.update(_HEADERS)
     try:
-        r = requests.get(url, headers=_headers(), params=params, timeout=20)
-        r.raise_for_status()
-        return r.json()
-    except requests.exceptions.HTTPError as e:
-        logger.warning(f"HTTP {e.response.status_code} for {endpoint} {params}")
-        return {}
+        s.get(f"{_BASE}/SEAT/SeatAvailability.html", timeout=20)
     except Exception as e:
-        logger.error(f"API error for {endpoint}: {e}")
-        return {}
+        logger.warning(f"Session init warning (non-fatal): {e}")
+    return s
 
 
-# ── Response field extraction (defensive against provider field name changes) ─
+# ── CAPTCHA ───────────────────────────────────────────────────────────────────
 
-def _extract_list(data: dict | list, *keys: str) -> list:
-    """Walk nested dicts looking for the first key that holds a list."""
-    if isinstance(data, list):
+def _preprocess(img: Image.Image) -> Image.Image:
+    img = img.convert("L")
+    img = img.resize((img.width * 3, img.height * 3), Image.LANCZOS)
+    img = ImageOps.autocontrast(img)
+    img = img.filter(ImageFilter.SHARPEN)
+    img = img.point(lambda p: 255 if p > 128 else 0, "1")
+    return img
+
+
+def _solve_captcha(session: requests.Session) -> str:
+    ts = int(time.time() * 1000)
+    r = session.get(f"{_CAPTCHA_URL}?{ts}", timeout=15)
+    img = Image.open(io.BytesIO(r.content))
+    img = _preprocess(img)
+    text = pytesseract.image_to_string(
+        img,
+        config=(
+            "--psm 8 --oem 3 "
+            "-c tessedit_char_whitelist="
+            "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
+        ),
+    )
+    return text.strip().replace(" ", "")
+
+
+def _post(session: requests.Session, payload: dict, max_retries: int = 4) -> dict:
+    """POST to CommonCaptcha, refreshing the CAPTCHA on each rejection."""
+    for attempt in range(max_retries):
+        captcha_text = _solve_captcha(session)
+        try:
+            r = session.post(
+                _API_URL,
+                json={**payload, "captcha": captcha_text},
+                timeout=20,
+            )
+            data = r.json() if r.text.strip() else {}
+        except Exception as e:
+            logger.warning(f"POST error attempt {attempt + 1}: {e}")
+            time.sleep(1)
+            continue
+
+        err = str(data.get("errorMessage", "")).lower()
+        if "captcha" in err or "invalid" in err or "wrong" in err:
+            logger.debug(f"CAPTCHA rejected (attempt {attempt + 1}), retrying…")
+            time.sleep(0.5)
+            continue
+
         return data
-    if not isinstance(data, dict):
-        return []
-    for key in keys:
-        val = data.get(key)
-        if isinstance(val, list):
-            return val
-        if isinstance(val, dict):
-            # one level deeper (e.g. body.avlDayList)
-            for inner_key in keys:
-                inner = val.get(inner_key)
-                if isinstance(inner, list):
-                    return inner
-    return []
+
+    logger.error(f"Giving up after {max_retries} CAPTCHA failures for payload: {payload}")
+    return {}
 
 
-def _str_field(obj: dict, *keys: str) -> str:
-    for key in keys:
-        val = obj.get(key, "")
-        if val:
-            return str(val).strip()
-    return ""
+# ── Train list (cached per route+date, expires at midnight) ──────────────────
 
-
-# ── Train list (cached per route+date, auto-expires at midnight) ─────────────
-
-@lru_cache(maxsize=64)
+@lru_cache(maxsize=32)
 def _cached_trains(
     from_station: str, to_station: str, date_str: str, _cache_day: str
 ) -> tuple:
-    data = _get(
-        "getTrainsBetweenStations",
+    session = _new_session()
+    data = _post(
+        session,
         {
-            "fromStationCode": from_station,
-            "toStationCode": to_station,
-            "dateOfJourney": date_str,
+            "pageId": "TBS",
+            "fromStation": from_station,
+            "toStation": to_station,
+            "journeyDate": date_str,
+            "language": "en",
         },
     )
-    trains = _extract_list(data, "data", "body", "trains", "Trains")
+    trains = (
+        data.get("trainBtwnStnsList")
+        or data.get("trainsList")
+        or data.get("trains")
+        or []
+    )
     if not trains:
         logger.warning(
             f"No trains returned for {from_station}→{to_station} on {date_str}. "
-            f"Raw response keys: {list(data.keys()) if isinstance(data, dict) else type(data)}"
+            f"Response keys: {list(data.keys())}"
         )
     return tuple(trains)
 
@@ -98,14 +148,8 @@ def get_trains_between(
 
 # ── Seat availability ─────────────────────────────────────────────────────────
 
-def parse_available_seats(availability_str: str) -> Optional[int]:
-    """
-    Parse IRCTC availability strings:
-      'AVAILABLE-42'  → 42
-      'GNWL28/WL15'   → None  (waitlisted)
-      'REGRET/WL'     → None  (fully booked)
-    """
-    s = (availability_str or "").strip().upper()
+def parse_available_seats(s: str) -> Optional[int]:
+    s = (s or "").strip().upper()
     if s.startswith("AVAILABLE-"):
         try:
             return int(s.split("-", 1)[1])
@@ -114,51 +158,46 @@ def parse_available_seats(availability_str: str) -> Optional[int]:
     return None
 
 
-def _parse_availability_response(data: dict | list) -> Optional[int]:
-    """Extract seat count from whatever shape the RapidAPI response takes."""
-    avail_list = _extract_list(
-        data, "data", "body", "avlDayList", "Availability", "availability"
-    )
-    if not avail_list:
-        return None
-    first = avail_list[0]
-    raw = _str_field(
-        first,
-        "availablityStatus",   # IRCTC spelling (sic)
-        "availabilityStatus",
-        "avail_status",
-        "Availability",
-        "status",
-    )
-    return parse_available_seats(raw) if raw else None
-
-
 def get_seat_availability(
-    train_no: str,
+    t_no: str,
     from_station: str,
     to_station: str,
     travel_date: datetime,
 ) -> dict[str, int]:
-    """
-    Returns {class_code: seats_available} for classes with open seats.
-    Waitlisted / non-existent classes are omitted.
-    """
+    """Returns {class_code: seats_available} for classes with open seats."""
     date_str = travel_date.strftime("%Y%m%d")
+    session = _new_session()
     results: dict[str, int] = {}
 
     for cls in CLASSES_TO_CHECK:
-        data = _get(
-            "checkSeatAvailability",
+        data = _post(
+            session,
             {
-                "fromStationCode": from_station,
-                "toStationCode": to_station,
-                "trainNo": train_no,
-                "date": date_str,
+                "pageId": "SeatAvailability",
+                "trainNo": t_no,
+                "fromStn": from_station,
+                "toStn": to_station,
+                "journeyDate": date_str,
                 "classType": cls,
                 "quota": "GN",
+                "language": "en",
             },
         )
-        seats = _parse_availability_response(data)
+        avl_list = (
+            data.get("avlDayList")
+            or data.get("availabilityList")
+            or data.get("Availability")
+            or []
+        )
+        if not avl_list:
+            continue
+        first = avl_list[0]
+        raw = ""
+        for key in ("availablityStatus", "availabilityStatus", "avail_status", "Availability"):
+            raw = first.get(key, "")
+            if raw:
+                break
+        seats = parse_available_seats(raw)
         if seats is not None:
             results[cls] = seats
 
@@ -167,18 +206,26 @@ def get_seat_availability(
 
 # ── Train record field helpers ────────────────────────────────────────────────
 
+def _str_field(obj: dict, *keys: str) -> str:
+    for key in keys:
+        val = obj.get(key, "")
+        if val:
+            return str(val).strip()
+    return ""
+
+
 def departure_time(train: dict) -> str:
     return _str_field(
         train,
-        "from_time", "departureTime", "DepartureTime",
-        "DepTime", "Source_Departure_time", "Departure",
+        "departTime", "departureTime", "from_time",
+        "DepartureTime", "DepTime", "Departure",
     )
 
 
 def train_no(train: dict) -> str:
-    return _str_field(train, "train_no", "trainNumber", "TrainNo", "Number", "Train_No")
+    return _str_field(train, "trainNo", "train_no", "trainNumber", "TrainNo", "Number")
 
 
 def train_name(train: dict) -> str:
-    raw = _str_field(train, "train_name", "trainName", "TrainName", "Name", "Train_Name")
+    raw = _str_field(train, "trainName", "train_name", "TrainName", "Name")
     return raw.title() if raw else "Unknown"

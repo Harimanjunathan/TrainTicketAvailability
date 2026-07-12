@@ -1,12 +1,13 @@
 """Entry point — two daily check runs at configurable times (default 9 AM and 5 PM IST)."""
 
 import logging
+import shutil
 import sys
 
 from apscheduler.schedulers.blocking import BlockingScheduler
 from apscheduler.triggers.cron import CronTrigger
 
-from config import CHECK_TIMES, EMAIL_FROM, EMAIL_PASSWORD, RAPIDAPI_KEY
+from config import CHECK_TIMES, EMAIL_FROM, EMAIL_PASSWORD
 from alert_engine import run_check
 
 logging.basicConfig(
@@ -22,16 +23,16 @@ TIMEZONE = "Asia/Kolkata"
 
 def _validate_config() -> None:
     errors = []
-    if not RAPIDAPI_KEY:
+    if not shutil.which("tesseract"):
         errors.append(
-            "RAPIDAPI_KEY is not set "
-            "(subscribe at https://rapidapi.com/IRCTCAPI/api/irctc1)"
+            "Tesseract not found. Install with: sudo apt-get install tesseract-ocr  "
+            "(or brew install tesseract on macOS)"
         )
     if not EMAIL_FROM:
-        errors.append("GMAIL_ADDRESS is not set")
+        errors.append("GMAIL_ADDRESS is not set in .env")
     if not EMAIL_PASSWORD:
         errors.append(
-            "GMAIL_APP_PASSWORD is not set "
+            "GMAIL_APP_PASSWORD is not set in .env "
             "(generate at https://myaccount.google.com/apppasswords)"
         )
     if errors:
@@ -72,8 +73,7 @@ def main() -> None:
         )
         logger.info(f"Scheduled check at {label} IST")
 
-    # Run once immediately on startup so you don't wait until the next scheduled time
-    logger.info("Running initial check on startup...")
+    logger.info("Running initial check on startup…")
     run_check()
 
     try:
