@@ -1,4 +1,4 @@
-"""Entry point — starts the APScheduler and runs immediately on launch."""
+"""Entry point — two daily check runs at configurable times (default 9 AM and 5 PM IST)."""
 
 import logging
 import sys
@@ -6,14 +6,8 @@ import sys
 from apscheduler.schedulers.blocking import BlockingScheduler
 from apscheduler.triggers.cron import CronTrigger
 
-from config import (
-    CHECK_INTERVAL_MINUTES,
-    DAILY_DIGEST_TIME,
-    EMAIL_FROM,
-    EMAIL_PASSWORD,
-    RAIL_API_KEY,
-)
-from alert_engine import run_checks, run_daily_digest
+from config import CHECK_TIMES, EMAIL_FROM, EMAIL_PASSWORD, RAPIDAPI_KEY
+from alert_engine import run_check
 
 logging.basicConfig(
     level=logging.INFO,
@@ -28,48 +22,59 @@ TIMEZONE = "Asia/Kolkata"
 
 def _validate_config() -> None:
     errors = []
-    if not RAIL_API_KEY:
-        errors.append("RAIL_API_KEY is not set (register at https://indianrailapi.com/registration)")
+    if not RAPIDAPI_KEY:
+        errors.append(
+            "RAPIDAPI_KEY is not set "
+            "(subscribe at https://rapidapi.com/IRCTCAPI/api/irctc1)"
+        )
     if not EMAIL_FROM:
         errors.append("GMAIL_ADDRESS is not set")
     if not EMAIL_PASSWORD:
-        errors.append("GMAIL_APP_PASSWORD is not set (create one at https://myaccount.google.com/apppasswords)")
+        errors.append(
+            "GMAIL_APP_PASSWORD is not set "
+            "(generate at https://myaccount.google.com/apppasswords)"
+        )
     if errors:
         for e in errors:
             logger.error(f"Config error: {e}")
         sys.exit(1)
 
 
+def _parse_check_times(times_str: str) -> list[tuple[int, int]]:
+    result = []
+    for t in times_str.split(","):
+        try:
+            h, m = map(int, t.strip().split(":"))
+            result.append((h, m))
+        except ValueError:
+            logger.warning(f"Ignoring invalid CHECK_TIMES entry: {t!r}")
+    return result
+
+
 def main() -> None:
     _validate_config()
 
-    digest_hour, digest_minute = map(int, DAILY_DIGEST_TIME.split(":"))
+    check_times = _parse_check_times(CHECK_TIMES)
+    if not check_times:
+        logger.error("No valid CHECK_TIMES configured. Example: CHECK_TIMES=09:00,17:00")
+        sys.exit(1)
 
     scheduler = BlockingScheduler(timezone=TIMEZONE)
 
-    scheduler.add_job(
-        run_checks,
-        "interval",
-        minutes=CHECK_INTERVAL_MINUTES,
-        id="hourly_checks",
-        max_instances=1,
-        coalesce=True,
-    )
-    scheduler.add_job(
-        run_daily_digest,
-        CronTrigger(hour=digest_hour, minute=digest_minute, timezone=TIMEZONE),
-        id="daily_digest",
-        max_instances=1,
-    )
+    for hour, minute in check_times:
+        label = f"{hour:02d}:{minute:02d}"
+        scheduler.add_job(
+            run_check,
+            CronTrigger(hour=hour, minute=minute, timezone=TIMEZONE),
+            id=f"check_{label}",
+            max_instances=1,
+            coalesce=True,
+        )
+        logger.info(f"Scheduled check at {label} IST")
 
-    logger.info(
-        f"Scheduler starting — "
-        f"availability checks every {CHECK_INTERVAL_MINUTES} min, "
-        f"daily digest at {DAILY_DIGEST_TIME} IST"
-    )
-
-    # Run once immediately so there's no wait on first launch
-    run_checks()
+    # Run once immediately on startup so you don't wait until the next scheduled time
+    logger.info("Running initial check on startup...")
+    run_check()
 
     try:
         scheduler.start()

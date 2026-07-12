@@ -108,14 +108,14 @@ def send_threshold_alert(
     _send(subject, html, text)
 
 
-def send_daily_digest(today_str: str, rows: list[dict]) -> None:
+def send_check_summary(run_label: str, rows: list[dict]) -> None:
     """
-    rows: list of dicts with keys:
-      date, route, train_no, train_name, departure, cls, seats
+    Sends the availability summary email for one check run (9 AM or 5 PM).
+    rows: list of dicts with keys: date, route, train_no, train_name, departure, cls, seats
     """
-    subject = f"[Train Digest] Daily Availability — {today_str}"
+    subject = f"[Train Summary] Availability as of {run_label}"
 
-    text_lines = [f"Daily Train Availability Digest — {today_str}", "=" * 70]
+    text_lines = [f"Train Availability as of {run_label}", "=" * 70]
     for r in rows:
         text_lines.append(
             f"{r['date']:15} | {r['route']:25} | {r['train_no']} {r['train_name']:20} "
@@ -146,8 +146,8 @@ def send_daily_digest(today_str: str, rows: list[dict]) -> None:
 
     html = f"""
 <html><body style="font-family:Arial,sans-serif;max-width:800px;margin:0 auto;">
-  <h2 style="color:#333;">Daily Train Availability Digest</h2>
-  <p style="color:#666;margin-top:-10px;">{today_str}</p>
+  <h2 style="color:#333;">Train Availability Summary</h2>
+  <p style="color:#666;margin-top:-10px;">As of {run_label}</p>
   <table border="1" style="border-collapse:collapse;width:100%;font-size:13px;">
     <thead>
       <tr style="background:#333;color:white;">

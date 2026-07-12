@@ -1,4 +1,4 @@
-"""Core logic: gather availability data, fire threshold alerts, build daily digest."""
+"""Core logic: gather availability data, fire threshold alerts, send check summary."""
 
 import logging
 from datetime import datetime, timedelta
@@ -11,7 +11,7 @@ from fetcher import (
     train_name,
     train_no,
 )
-from notifier import send_daily_digest, send_threshold_alert
+from notifier import send_check_summary, send_threshold_alert
 import state
 
 logger = logging.getLogger(__name__)
@@ -27,7 +27,6 @@ def _relevant_dates(route: dict) -> list[datetime]:
 
 
 def _parse_time(time_str: str):
-    """Parse HH:MM or HH:MM:SS, return a comparable time object or None."""
     for fmt in ("%H:%M:%S", "%H:%M"):
         try:
             return datetime.strptime(time_str.strip(), fmt).time()
@@ -40,13 +39,11 @@ def _in_window(dep_str: str, window: tuple[str, str]) -> bool:
     dep = _parse_time(dep_str)
     if dep is None:
         return False
-    start = _parse_time(window[0])
-    end = _parse_time(window[1])
-    return start <= dep <= end
+    return _parse_time(window[0]) <= dep <= _parse_time(window[1])
 
 
 def _collect_route(route: dict) -> list[dict]:
-    """Return availability rows for all trains/dates/classes on one route."""
+    """Fetch availability for all in-window trains across all monitored dates."""
     rows = []
     for travel_date in _relevant_dates(route):
         trains = get_trains_between(route["from_station"], route["to_station"], travel_date)
@@ -56,7 +53,9 @@ def _collect_route(route: dict) -> list[dict]:
                 continue
             t_no = train_no(t)
             t_name = train_name(t)
-            avail = get_seat_availability(t_no, route["from_station"], route["to_station"], travel_date)
+            avail = get_seat_availability(
+                t_no, route["from_station"], route["to_station"], travel_date
+            )
             for cls, seats in avail.items():
                 rows.append(
                     {
@@ -72,64 +71,62 @@ def _collect_route(route: dict) -> list[dict]:
     return rows
 
 
-def run_checks() -> None:
-    """Hourly job: check all routes and fire threshold alerts if needed."""
-    logger.info("Running availability checks...")
-    total_checked = 0
+def run_check() -> None:
+    """
+    Runs at each scheduled time (9 AM and 5 PM IST):
+    1. Fetches availability for all monitored routes/dates/classes.
+    2. Fires threshold alert emails for newly crossed thresholds.
+    3. Sends a full availability summary email.
+    """
+    now_label = datetime.now().strftime("%d %b %Y, %I:%M %p")
+    logger.info(f"Running availability check at {now_label}...")
 
+    all_rows: list[dict] = []
     for route in ROUTES:
-        rows = _collect_route(route)
-        total_checked += len(rows)
-        for row in rows:
-            date_str_key = row["travel_date"].strftime("%Y%m%d")
-            for threshold in ALERT_THRESHOLDS:
-                if row["seats"] <= threshold and not state.has_alert_fired(
-                    row["train_no"], route["from_station"], date_str_key, row["cls"], threshold
-                ):
-                    state.mark_alert_fired(
-                        row["train_no"], route["from_station"], date_str_key, row["cls"], threshold
-                    )
-                    send_threshold_alert(
-                        route_name=route["name"],
-                        train_no=row["train_no"],
-                        train_name=row["train_name"],
-                        travel_date=row["travel_date"].strftime("%d %b %Y (%A)"),
-                        departure=row["departure"],
-                        cls=row["cls"],
-                        seats_available=row["seats"],
-                        threshold=threshold,
-                    )
+        all_rows.extend(_collect_route(route))
 
-    logger.info(f"Check complete — {total_checked} train/class combinations checked.")
+    # ── Threshold alerts ──────────────────────────────────────────────────────
+    alerts_fired = 0
+    for row in all_rows:
+        date_key = row["travel_date"].strftime("%Y%m%d")
+        for threshold in ALERT_THRESHOLDS:
+            if row["seats"] <= threshold and not state.has_alert_fired(
+                row["train_no"], row["route"]["from_station"], date_key, row["cls"], threshold
+            ):
+                state.mark_alert_fired(
+                    row["train_no"], row["route"]["from_station"], date_key, row["cls"], threshold
+                )
+                send_threshold_alert(
+                    route_name=row["route"]["name"],
+                    train_no=row["train_no"],
+                    train_name=row["train_name"],
+                    travel_date=row["travel_date"].strftime("%d %b %Y (%A)"),
+                    departure=row["departure"],
+                    cls=row["cls"],
+                    seats_available=row["seats"],
+                    threshold=threshold,
+                )
+                alerts_fired += 1
 
+    # ── Summary email ─────────────────────────────────────────────────────────
+    summary_rows = sorted(
+        [
+            {
+                "date": r["travel_date"].strftime("%d %b (%a)"),
+                "route": r["route"]["name"],
+                "train_no": r["train_no"],
+                "train_name": r["train_name"],
+                "departure": r["departure"],
+                "cls": r["cls"],
+                "seats": r["seats"],
+            }
+            for r in all_rows
+        ],
+        key=lambda r: (r["date"], r["route"], r["departure"]),
+    )
+    send_check_summary(now_label, summary_rows)
 
-def run_daily_digest() -> None:
-    """Daily digest job: send one summary email of all upcoming trains."""
-    today_str = datetime.today().strftime("%Y-%m-%d")
-    if state.has_daily_digest_fired(today_str):
-        logger.debug("Daily digest already sent today, skipping.")
-        return
-
-    logger.info("Sending daily digest...")
-    digest_rows = []
-
-    for route in ROUTES:
-        rows = _collect_route(route)
-        for row in rows:
-            digest_rows.append(
-                {
-                    "date": row["travel_date"].strftime("%d %b (%a)"),
-                    "route": route["name"],
-                    "train_no": row["train_no"],
-                    "train_name": row["train_name"],
-                    "departure": row["departure"],
-                    "cls": row["cls"],
-                    "seats": row["seats"],
-                }
-            )
-
-    # Sort by date then route then departure
-    digest_rows.sort(key=lambda r: (r["date"], r["route"], r["departure"]))
-
-    send_daily_digest(today_str, digest_rows)
-    state.mark_daily_digest_fired(today_str)
+    logger.info(
+        f"Check complete — {len(all_rows)} combinations checked, "
+        f"{alerts_fired} new threshold alert(s) fired."
+    )
