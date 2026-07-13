@@ -68,7 +68,7 @@ def _preprocess(img: Image.Image) -> Image.Image:
 
 def _solve_captcha(session: requests.Session) -> str:
     ts = int(time.time() * 1000)
-    r = session.get(f"{_CAPTCHA_URL}?{ts}", timeout=15)
+    r = session.get(f"{_CAPTCHA_URL}?{ts}", timeout=(10, 10))
     img = Image.open(io.BytesIO(r.content))
     img = _preprocess(img)
     text = pytesseract.image_to_string(
@@ -82,19 +82,24 @@ def _solve_captcha(session: requests.Session) -> str:
     return text.strip().replace(" ", "")
 
 
-def _post(session: requests.Session, payload: dict, max_retries: int = 4) -> dict:
-    """POST to CommonCaptcha, refreshing the CAPTCHA on each rejection."""
+def _post(session: requests.Session, payload: dict, max_retries: int = 3) -> dict:
+    """POST to CommonCaptcha, refreshing the CAPTCHA on each rejection.
+
+    Every network call in the retry loop (both the CAPTCHA image fetch and
+    the POST itself) is caught, so a single timeout/connection error costs
+    one retry instead of crashing the whole run.
+    """
     for attempt in range(max_retries):
-        captcha_text = _solve_captcha(session)
         try:
+            captcha_text = _solve_captcha(session)
             r = session.post(
                 _API_URL,
                 json={**payload, "captcha": captcha_text},
-                timeout=20,
+                timeout=(10, 15),
             )
             data = r.json() if r.text.strip() else {}
         except Exception as e:
-            logger.warning(f"POST error attempt {attempt + 1}: {e}")
+            logger.warning(f"Request error attempt {attempt + 1}: {e}")
             time.sleep(1)
             continue
 
@@ -106,7 +111,7 @@ def _post(session: requests.Session, payload: dict, max_retries: int = 4) -> dic
 
         return data
 
-    logger.error(f"Giving up after {max_retries} CAPTCHA failures for payload: {payload}")
+    logger.error(f"Giving up after {max_retries} failures for payload: {payload}")
     return {}
 
 
