@@ -6,7 +6,7 @@
 
 Monitors Chennai ↔ Bangalore train seat availability and sends email alerts when seats start filling up.
 
-## What it does
+## [Draft] What it does [Train Availability Monitor which is under draft]
 
 - Checks availability every hour for:
   - **Chennai → Bangalore** evening trains on Mondays & Tuesdays
