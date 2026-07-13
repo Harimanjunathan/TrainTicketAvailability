@@ -1,4 +1,8 @@
-# Train Ticket Availability Monitor
+# News Digest and Train Ticket Availability Monitor
+
+1. Sends News Digest Everyday using the NewsAPI.org
+
+2. Train Logic (Draft, currently not functional) can be seen below
 
 Monitors Chennai ↔ Bangalore train seat availability and sends email alerts when seats start filling up.
 
