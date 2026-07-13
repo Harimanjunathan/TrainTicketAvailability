@@ -1,6 +1,6 @@
 # News Digest and Train Ticket Availability Monitor
 
-1. Sends News Digest Everyday using the NewsAPI.org
+1. Sends News Digest Everyday to my email id using the NewsAPI.org
 
 2. Train Logic (Draft, currently not functional) can be seen below
 
