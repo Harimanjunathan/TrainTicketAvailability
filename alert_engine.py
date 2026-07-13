@@ -46,16 +46,24 @@ def _collect_route(route: dict) -> list[dict]:
     """Fetch availability for all in-window trains across all monitored dates."""
     rows = []
     for travel_date in _relevant_dates(route):
-        trains = get_trains_between(route["from_station"], route["to_station"], travel_date)
+        try:
+            trains = get_trains_between(route["from_station"], route["to_station"], travel_date)
+        except Exception as e:
+            logger.error(f"Failed to fetch trains for {route['name']} on {travel_date.date()}: {e}")
+            continue
         for t in trains:
             dep = departure_time(t)
             if not _in_window(dep, route["departure_window"]):
                 continue
             t_no = train_no(t)
             t_name = train_name(t)
-            avail = get_seat_availability(
-                t_no, route["from_station"], route["to_station"], travel_date
-            )
+            try:
+                avail = get_seat_availability(
+                    t_no, route["from_station"], route["to_station"], travel_date
+                )
+            except Exception as e:
+                logger.error(f"Failed to fetch seat availability for train {t_no}: {e}")
+                continue
             for cls, seats in avail.items():
                 rows.append(
                     {
