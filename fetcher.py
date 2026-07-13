@@ -19,7 +19,7 @@ import requests
 from PIL import Image, ImageFilter, ImageOps
 import pytesseract
 
-from config import CLASSES_TO_CHECK
+from config import CLASSES_TO_CHECK, KNOWN_TRAINS
 
 logger = logging.getLogger(__name__)
 
@@ -42,11 +42,14 @@ _HEADERS = {
 
 # ── Session ───────────────────────────────────────────────────────────────────
 
-def _new_session() -> requests.Session:
+def _new_session(page: str = "SEAT/SeatAvailability.html") -> requests.Session:
+    """Create a session seeded with cookies from the given enquiry page."""
     s = requests.Session()
-    s.headers.update(_HEADERS)
+    headers = dict(_HEADERS)
+    headers["Referer"] = f"{_BASE}/{page}"
+    s.headers.update(headers)
     try:
-        s.get(f"{_BASE}/SEAT/SeatAvailability.html", timeout=20)
+        s.get(f"{_BASE}/{page}", timeout=20)
     except Exception as e:
         logger.warning(f"Session init warning (non-fatal): {e}")
     return s
@@ -109,32 +112,68 @@ def _post(session: requests.Session, payload: dict, max_retries: int = 4) -> dic
 
 # ── Train list (cached per route+date, expires at midnight) ──────────────────
 
-@lru_cache(maxsize=32)
-def _cached_trains(
-    from_station: str, to_station: str, date_str: str, _cache_day: str
-) -> tuple:
-    session = _new_session()
-    data = _post(
-        session,
-        {
-            "pageId": "TBS",
-            "fromStation": from_station,
-            "toStation": to_station,
-            "journeyDate": date_str,
-            "language": "en",
-        },
-    )
-    trains = (
+def _extract_trains(data: dict) -> list:
+    return (
         data.get("trainBtwnStnsList")
         or data.get("trainsList")
         or data.get("trains")
         or []
     )
+
+
+def _tbs_payload(from_station: str, to_station: str, date_str: str) -> dict:
+    """Build the trains-between-stations POST payload (YYYYMMDD date)."""
+    return {
+        "pageId": "TBS",
+        "inputPage": "TBS",
+        "trainFromStn": from_station,
+        "trainToStn": to_station,
+        "datOfJourney": date_str,
+        "flexiFlag": "N",
+        "ticketType": "E",
+        "trainClass": "ALL",
+        "quota": "GN",
+        "language": "en",
+    }
+
+
+@lru_cache(maxsize=32)
+def _cached_trains(
+    from_station: str, to_station: str, date_str: str, _cache_day: str
+) -> tuple:
+    """date_str is YYYYMMDD."""
+    session = _new_session("TBS/TrainBetweenStation.html")
+
+    # First attempt: YYYYMMDD date format (used by seat-availability endpoint)
+    data = _post(session, _tbs_payload(from_station, to_station, date_str))
+    trains = _extract_trains(data)
+
+    if not trains:
+        # Second attempt: DD-MM-YYYY date format (some TBS versions expect this)
+        try:
+            from datetime import datetime as _dt
+            alt_date = _dt.strptime(date_str, "%Y%m%d").strftime("%d-%m-%Y")
+            data2 = _post(session, _tbs_payload(from_station, to_station, alt_date))
+            trains = _extract_trains(data2)
+        except Exception as e:
+            logger.debug(f"Alt date format attempt failed: {e}")
+
     if not trains:
         logger.warning(
-            f"No trains returned for {from_station}→{to_station} on {date_str}. "
-            f"Response keys: {list(data.keys())}"
+            f"Live API returned no trains for {from_station}→{to_station} on {date_str} "
+            f"(response keys: {list(data.keys())}). Falling back to hardcoded list."
         )
+        trains = list(KNOWN_TRAINS.get((from_station, to_station), []))
+        if trains:
+            logger.info(
+                f"Using {len(trains)} hardcoded trains for {from_station}→{to_station}"
+            )
+        else:
+            logger.error(
+                f"No hardcoded trains configured for {from_station}→{to_station}. "
+                "Add entries to KNOWN_TRAINS in config.py."
+            )
+
     return tuple(trains)
 
 
